@@ -1,28 +1,57 @@
 #property strict
-#property version "1.00"
-#property description "EURUSD H1 EMA crossover; demo/tester only. No profitability guarantee."
+#property version "1.10"
+#property description "EURUSD H1 EMA + optional closed-bar ADX filter; demo/tester only."
+
+#include "SmartForexBotCore.mqh"
 
 input string InpSymbol             = "EURUSD"; // Broker suffix supported, e.g. EURUSD.a
 input ENUM_TIMEFRAMES InpTimeframe  = PERIOD_H1;
 input int    InpFastEMA             = 20;
 input int    InpSlowEMA             = 50;
 input int    InpATRPeriod           = 14;
+input bool   InpUseADXFilter        = true;
+input int    InpADXPeriod           = 14;
+input double InpMinADX              = 20.0; // Require ADX strictly above this value
 input double InpSLATR               = 1.5;
 input double InpTPATR               = 2.0;
-input double InpRiskPercent         = 0.5; // Hard maximum 0.5%
+input double InpRiskPercent         = 0.25; // Hard maximum 0.5%
 input double InpCostReservePercent  = 10.0; // Portion of risk budget reserved for costs
 input double InpDailyLossPercent    = 2.0; // Hard maximum 2%
 input int    InpMaxSpreadPoints     = 20;  // 20 points = 2 pips on a 5-digit symbol
 input int    InpDeviationPoints     = 10;
 input ulong  InpMagic               = 205014;
 input bool   InpCloseOnDailyLimit   = true;
+input bool   InpLogSignals          = true;
 
 int fast_handle=INVALID_HANDLE, slow_handle=INVALID_HANDLE, atr_handle=INVALID_HANDLE;
+int adx_handle=INVALID_HANDLE;
 datetime last_bar=0;
+datetime data_warning_bar=0;
 int day_id=0;
 double day_equity=0;
 bool daily_locked=false;
 string day_key="";
+
+struct SignalContext
+{
+   datetime bar;
+   int direction;
+   double fast_previous;
+   double slow_previous;
+   double fast_closed;
+   double slow_closed;
+   double atr;
+   double adx;
+   bool atr_ready;
+   bool adx_ready;
+};
+
+enum SFB_SEND_STATUS
+{
+   SFB_SEND_REJECTED,
+   SFB_SEND_ACCEPTED,
+   SFB_SEND_UNCERTAIN
+};
 
 void Log(const string message) { Print("SmartForexBot | ",message); }
 bool IsTester() { return (bool)MQLInfoInteger(MQL_TESTER); }
@@ -70,7 +99,7 @@ bool UpdateDailyState()
    }
    if(!MathIsValidNumber(day_equity) || day_equity<=0) return false;
    if(!IsTester() && GlobalVariableCheck(day_key+".locked")) daily_locked=true;
-   if(!daily_locked && AccountInfoDouble(ACCOUNT_EQUITY)<=day_equity*(1.0-InpDailyLossPercent/100.0))
+   if(!daily_locked && SFBDailyLossReached(day_equity,AccountInfoDouble(ACCOUNT_EQUITY),InpDailyLossPercent))
    {
       daily_locked=true;
       Log("Daily equity loss limit reached; entries locked until next broker day.");
@@ -85,13 +114,16 @@ bool UpdateDailyState()
    }
    return true;
 }
-bool TradingAllowed()
+string TradingBlockReason()
 {
-   return SafeAccount() && (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)
-       && (bool)MQLInfoInteger(MQL_TRADE_ALLOWED)
-       && (bool)AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)
-       && (bool)AccountInfoInteger(ACCOUNT_TRADE_EXPERT);
+   if(!SafeAccount()) return "account_is_not_demo_or_tester";
+   if(!(bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return "terminal_algo_trading_disabled";
+   if(!(bool)MQLInfoInteger(MQL_TRADE_ALLOWED)) return "EA_algo_trading_disabled";
+   if(!(bool)AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)) return "account_trading_disabled";
+   if(!(bool)AccountInfoInteger(ACCOUNT_TRADE_EXPERT)) return "account_expert_trading_disabled";
+   return "";
 }
+bool TradingAllowed() { return TradingBlockReason()==""; }
 bool FillingMode(ENUM_ORDER_TYPE_FILLING &mode)
 {
    long flags=SymbolInfoInteger(InpSymbol,SYMBOL_FILLING_MODE);
@@ -101,23 +133,28 @@ bool FillingMode(ENUM_ORDER_TYPE_FILLING &mode)
    { mode=ORDER_FILLING_RETURN; return true; }
    return false;
 }
-bool SendChecked(MqlTradeRequest &request)
+SFB_SEND_STATUS SendChecked(MqlTradeRequest &request,string &reason)
 {
    MqlTradeCheckResult check={};
    ResetLastError();
    if(!OrderCheck(request,check))
    {
-      Log(StringFormat("OrderCheck rejected: error=%d retcode=%u %s",GetLastError(),check.retcode,check.comment));
-      return false;
+      reason=StringFormat("OrderCheck_rejected error=%d retcode=%u comment=%s",GetLastError(),check.retcode,check.comment);
+      Log(reason);
+      return SFB_SEND_REJECTED;
    }
    MqlTradeResult result={};
    ResetLastError();
    bool sent=OrderSend(request,result);
-   Log(StringFormat("OrderSend ok=%s error=%d retcode=%u order=%I64u deal=%I64u %s",
-       sent?"true":"false",GetLastError(),result.retcode,result.order,result.deal,result.comment));
+   reason=StringFormat("OrderSend ok=%s error=%d retcode=%u order=%I64u deal=%I64u comment=%s",
+       sent?"true":"false",GetLastError(),result.retcode,result.order,result.deal,result.comment);
+   Log(reason);
    // No automatic retry: a timeout or accepted/partial order may already have executed.
-   return sent && (result.retcode==TRADE_RETCODE_DONE || result.retcode==TRADE_RETCODE_DONE_PARTIAL
-                   || result.retcode==TRADE_RETCODE_PLACED);
+   if(sent && (result.retcode==TRADE_RETCODE_DONE || result.retcode==TRADE_RETCODE_DONE_PARTIAL
+               || result.retcode==TRADE_RETCODE_PLACED)) return SFB_SEND_ACCEPTED;
+   if(result.retcode==TRADE_RETCODE_TIMEOUT || result.retcode==TRADE_RETCODE_CONNECTION
+      || result.retcode==0) return SFB_SEND_UNCERTAIN;
+   return SFB_SEND_REJECTED;
 }
 bool SymbolOccupied()
 {
@@ -149,7 +186,8 @@ void CloseOwnPositions()
       request.deviation=(ulong)InpDeviationPoints;
       request.comment="SFB daily loss exit";
       if(!FillingMode(request.type_filling)) continue;
-      SendChecked(request);
+      string reason;
+      SendChecked(request,reason);
    }
 }
 double PriceRound(const double price,const double step,const bool up)
@@ -161,22 +199,63 @@ double VolumeDown(const double volume,const double step)
 {
    return NormalizeDouble(MathFloor(volume/step)*step,8);
 }
-void Enter(const ENUM_ORDER_TYPE side,const double atr)
+void SignalDecision(const string context,const string decision,const string reason)
 {
-   if(!TradingAllowed() || SymbolOccupied()) return;
+   if(InpLogSignals) Log(context+" decision="+decision+" reason="+reason);
+}
+string SignalDescription(const SignalContext &signal)
+{
+   string description=StringFormat("Signal candle=%s evaluated=%s side=%s EMA_fast[2]=%.*f EMA_slow[2]=%.*f EMA_fast[1]=%.*f EMA_slow[1]=%.*f",
+      TimeToString(signal.bar,TIME_DATE|TIME_MINUTES),TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS),
+      signal.direction>0?"BUY":"SELL",_Digits,signal.fast_previous,_Digits,signal.slow_previous,
+      _Digits,signal.fast_closed,_Digits,signal.slow_closed);
+   description+=" ATR[1]="+(signal.atr_ready?DoubleToString(signal.atr,_Digits):"unavailable");
+   description+=" ADX[1]="+(signal.adx_ready?DoubleToString(signal.adx,4):"unavailable");
+   description+=" ADX_filter="+(InpUseADXFilter?"on":"off")+" ADX_threshold="+DoubleToString(InpMinADX,4);
+   return description;
+}
+void Enter(const SignalContext &signal)
+{
+   ENUM_ORDER_TYPE side=signal.direction>0?ORDER_TYPE_BUY:ORDER_TYPE_SELL;
+   double atr=signal.atr;
+   double equity=AccountInfoDouble(ACCOUNT_EQUITY);
+   double risk_base=MathMin(equity,AccountInfoDouble(ACCOUNT_BALANCE));
+   double budget=risk_base*InpRiskPercent/100.0;
+   // Include the remaining daily allowance and cost reserve in every signal log.
+   budget=MathMin(budget,equity-day_equity*(1.0-InpDailyLossPercent/100.0));
+   budget*=1.0-InpCostReservePercent/100.0;
+   MqlTick tick={};
+   double point=SymbolInfoDouble(InpSymbol,SYMBOL_POINT);
+   double step=SymbolInfoDouble(InpSymbol,SYMBOL_TRADE_TICK_SIZE);
+   bool quote_ready=SymbolInfoTick(InpSymbol,tick) && SFBValidIndicator(tick.bid)
+                    && SFBValidIndicator(tick.ask) && tick.bid>0 && tick.ask>tick.bid;
+   string context=SignalDescription(signal);
+   context+=" spread_points="+(quote_ready && point>0?DoubleToString((tick.ask-tick.bid)/point,2):"unavailable");
+   context+=StringFormat(" equity=%.2f risk_base=%.2f risk_percent=%.4f daily_reference=%.2f budget=%.2f currency=%s",
+      equity,risk_base,InpRiskPercent,day_equity,budget,AccountInfoString(ACCOUNT_CURRENCY));
+   // Safety applies even when the ADX filter is disabled or ADX is unavailable.
+   if(daily_locked) { SignalDecision(context,"SKIPPED","daily_loss_locked"); return; }
+   string restriction=TradingBlockReason();
+   if(restriction!="") { SignalDecision(context,"SKIPPED",restriction); return; }
+   if(SymbolOccupied()) { SignalDecision(context,"SKIPPED","symbol_has_position_or_order"); return; }
+   if(!signal.atr_ready) { SignalDecision(context,"SKIPPED","ATR_unavailable_or_invalid"); return; }
+   if(InpUseADXFilter && !signal.adx_ready)
+   { SignalDecision(context,"SKIPPED","ADX_unavailable_or_invalid"); return; }
+   if(!SFBPassADX(InpUseADXFilter,signal.adx,InpMinADX))
+   { SignalDecision(context,"SKIPPED","ADX_not_strictly_above_threshold"); return; }
    long trade_mode=SymbolInfoInteger(InpSymbol,SYMBOL_TRADE_MODE);
    if(trade_mode==SYMBOL_TRADE_MODE_DISABLED || trade_mode==SYMBOL_TRADE_MODE_CLOSEONLY
       || (side==ORDER_TYPE_BUY && trade_mode==SYMBOL_TRADE_MODE_SHORTONLY)
-      || (side==ORDER_TYPE_SELL && trade_mode==SYMBOL_TRADE_MODE_LONGONLY)) return;
+      || (side==ORDER_TYPE_SELL && trade_mode==SYMBOL_TRADE_MODE_LONGONLY))
+   { SignalDecision(context,"SKIPPED","broker_trade_mode_blocks_direction"); return; }
    long order_mode=SymbolInfoInteger(InpSymbol,SYMBOL_ORDER_MODE);
    if((order_mode & SYMBOL_ORDER_MARKET)==0 || (order_mode & SYMBOL_ORDER_SL)==0
-      || (order_mode & SYMBOL_ORDER_TP)==0) { Log("Broker does not support required market/SL/TP orders."); return; }
-   MqlTick tick;
-   if(!SymbolInfoTick(InpSymbol,tick) || tick.ask<=tick.bid || tick.bid<=0) return;
-   double point=SymbolInfoDouble(InpSymbol,SYMBOL_POINT);
-   double step=SymbolInfoDouble(InpSymbol,SYMBOL_TRADE_TICK_SIZE);
-   if(point<=0 || step<=0 || !MathIsValidNumber(atr) || atr<=0) return;
-   if((tick.ask-tick.bid)/point>InpMaxSpreadPoints) { Log("Signal skipped: spread too high."); return; }
+      || (order_mode & SYMBOL_ORDER_TP)==0)
+   { SignalDecision(context,"SKIPPED","broker_requires_unsupported_market_SL_TP"); return; }
+   if(!quote_ready) { SignalDecision(context,"SKIPPED","quote_unavailable_or_invalid"); return; }
+   if(point<=0 || step<=0) { SignalDecision(context,"SKIPPED","invalid_broker_price_step"); return; }
+   if((tick.ask-tick.bid)/point>InpMaxSpreadPoints)
+   { SignalDecision(context,"SKIPPED","spread_above_limit"); return; }
    bool buy=side==ORDER_TYPE_BUY;
    double entry=buy?tick.ask:tick.bid;
    double distance=(double)MathMax(SymbolInfoInteger(InpSymbol,SYMBOL_TRADE_STOPS_LEVEL),
@@ -186,36 +265,66 @@ void Enter(const ENUM_ORDER_TYPE side,const double atr)
    double tp=buy?MathMax(entry+InpTPATR*atr,tick.bid+distance):MathMin(entry-InpTPATR*atr,tick.ask-distance);
    sl=PriceRound(sl,step,!buy);
    tp=PriceRound(tp,step,buy);
-   if(sl<=0 || tp<=0) return;
+   context+=StringFormat(" entry=%.*f SL=%.*f TP=%.*f",_Digits,entry,_Digits,sl,_Digits,tp);
+   if(!SFBValidIndicator(sl) || !SFBValidIndicator(tp) || sl<=0 || tp<=0)
+   { SignalDecision(context,"SKIPPED","invalid_stop_prices"); return; }
    double worst_entry=entry+(buy?1.0:-1.0)*InpDeviationPoints*point;
-   double equity=AccountInfoDouble(ACCOUNT_EQUITY);
-   double risk_base=MathMin(equity,AccountInfoDouble(ACCOUNT_BALANCE));
-   double budget=risk_base*InpRiskPercent/100.0;
-   // Do not allocate more than the remaining daily loss allowance.
-   budget=MathMin(budget,equity-day_equity*(1.0-InpDailyLossPercent/100.0));
-   budget*=1.0-InpCostReservePercent/100.0;
    double minvol=SymbolInfoDouble(InpSymbol,SYMBOL_VOLUME_MIN);
    double maxvol=SymbolInfoDouble(InpSymbol,SYMBOL_VOLUME_MAX);
    double volstep=SymbolInfoDouble(InpSymbol,SYMBOL_VOLUME_STEP);
-   if(budget<=0 || minvol<=0 || maxvol<minvol || volstep<=0 || worst_entry<=0) return;
+   if(!SFBValidIndicator(budget) || budget<=0 || minvol<=0 || maxvol<minvol || volstep<=0 || worst_entry<=0)
+   { SignalDecision(context,"SKIPPED","invalid_risk_budget_or_broker_volume_rules"); return; }
    double loss=0;
    ResetLastError();
-   if(!OrderCalcProfit(side,InpSymbol,minvol,worst_entry,sl,loss) || loss>=0)
-   { Log(StringFormat("OrderCalcProfit failed or invalid loss: %d",GetLastError())); return; }
+   if(!OrderCalcProfit(side,InpSymbol,minvol,worst_entry,sl,loss) || !SFBValidIndicator(loss) || loss>=0)
+   {
+      string reason=StringFormat("OrderCalcProfit_failed_or_invalid error=%d",GetLastError());
+      Log(reason);
+      SignalDecision(context,"SKIPPED",reason);
+      return;
+   }
    double volume=VolumeDown(MathMin(maxvol,budget/(-loss/minvol)),volstep);
-   if(volume<minvol) { Log("Signal skipped: broker minimum volume exceeds risk budget."); return; }
+   context+=StringFormat(" minimum_lot_loss=%.2f volume_before_margin=%.8f",-loss,volume);
+   if(volume<minvol) { SignalDecision(context,"SKIPPED","minimum_volume_exceeds_risk_budget"); return; }
    double margin=0;
    if(!OrderCalcMargin(side,InpSymbol,volume,worst_entry,margin))
-   { Log(StringFormat("OrderCalcMargin failed: %d",GetLastError())); return; }
+   {
+      string reason=StringFormat("OrderCalcMargin_failed error=%d",GetLastError());
+      Log(reason);
+      SignalDecision(context,"SKIPPED",reason);
+      return;
+   }
    double available=AccountInfoDouble(ACCOUNT_MARGIN_FREE)*0.95;
-   if(available<=0) return;
+   context+=StringFormat(" available_margin=%.2f",available);
+   if(!SFBValidIndicator(available) || available<=0 || !SFBValidIndicator(margin) || margin<0)
+   { SignalDecision(context,"SKIPPED","invalid_or_insufficient_free_margin"); return; }
    if(margin>available) volume=VolumeDown(volume*available/margin,volstep);
-   if(volume<minvol) { Log("Signal skipped: insufficient margin for minimum volume."); return; }
+   context+=StringFormat(" volume=%.8f",volume);
+   if(volume<minvol) { SignalDecision(context,"SKIPPED","insufficient_margin_for_minimum_volume"); return; }
    // Recheck final rounded size and margin before the broker-side OrderCheck.
-   if(!OrderCalcProfit(side,InpSymbol,volume,worst_entry,sl,loss) || loss>=0 || -loss>budget
-      || !OrderCalcMargin(side,InpSymbol,volume,worst_entry,margin) || margin>available)
-   { Log("Signal skipped: final risk/margin validation failed."); return; }
-   if(SymbolOccupied()) return;
+   ResetLastError();
+   if(!OrderCalcProfit(side,InpSymbol,volume,worst_entry,sl,loss))
+   {
+      string reason=StringFormat("final_OrderCalcProfit_failed error=%d",GetLastError());
+      Log(reason);
+      SignalDecision(context,"SKIPPED",reason);
+      return;
+   }
+   context+=StringFormat(" modeled_SL_loss=%.2f",-loss);
+   if(!SFBValidIndicator(loss) || loss>=0 || -loss>budget)
+   { SignalDecision(context,"SKIPPED","final_modeled_loss_invalid_or_above_budget"); return; }
+   ResetLastError();
+   if(!OrderCalcMargin(side,InpSymbol,volume,worst_entry,margin))
+   {
+      string reason=StringFormat("final_OrderCalcMargin_failed error=%d",GetLastError());
+      Log(reason);
+      SignalDecision(context,"SKIPPED",reason);
+      return;
+   }
+   context+=StringFormat(" required_margin=%.2f",margin);
+   if(!SFBValidIndicator(margin) || margin<0 || margin>available)
+   { SignalDecision(context,"SKIPPED","final_margin_invalid_or_above_available"); return; }
+   if(SymbolOccupied()) { SignalDecision(context,"SKIPPED","symbol_became_occupied"); return; }
    MqlTradeRequest request={};
    request.action=TRADE_ACTION_DEAL;
    request.symbol=InpSymbol;
@@ -227,10 +336,11 @@ void Enter(const ENUM_ORDER_TYPE side,const double atr)
    request.tp=tp;
    request.deviation=(ulong)InpDeviationPoints;
    request.comment="SmartForexBot EMA";
-   if(!FillingMode(request.type_filling)) { Log("No supported filling policy."); return; }
-   Log(StringFormat("Signal %s volume=%.8f SL=%.*f TP=%.*f modeled SL loss=%.2f budget=%.2f",
-       buy?"BUY":"SELL",volume,_Digits,sl,_Digits,tp,-loss,budget));
-   SendChecked(request);
+   if(!FillingMode(request.type_filling)) { SignalDecision(context,"SKIPPED","no_supported_filling_policy"); return; }
+   string reason;
+   SFB_SEND_STATUS status=SendChecked(request,reason);
+   string decision=status==SFB_SEND_ACCEPTED?"ORDER_ACCEPTED":(status==SFB_SEND_UNCERTAIN?"ORDER_UNCERTAIN":"ORDER_REJECTED");
+   SignalDecision(context,decision,reason);
 }
 int OnInit()
 {
@@ -240,6 +350,8 @@ int OnInit()
       || SymbolInfoString(InpSymbol,SYMBOL_CURRENCY_PROFIT)!="USD")
    { Log("Attach to EURUSD H1; set InpSymbol to the exact broker symbol."); return INIT_PARAMETERS_INCORRECT; }
    if(InpFastEMA<1 || InpSlowEMA<=InpFastEMA || InpSlowEMA>10000 || InpATRPeriod<1 || InpATRPeriod>10000
+      || InpADXPeriod<1 || InpADXPeriod>10000
+      || !SFBValidIndicator(InpMinADX) || InpMinADX<0 || InpMinADX>100
       || !MathIsValidNumber(InpSLATR) || InpSLATR<=0 || !MathIsValidNumber(InpTPATR) || InpTPATR<=0
       || !MathIsValidNumber(InpRiskPercent) || InpRiskPercent<=0 || InpRiskPercent>0.5
       || !MathIsValidNumber(InpCostReservePercent) || InpCostReservePercent<0 || InpCostReservePercent>=100
@@ -249,11 +361,19 @@ int OnInit()
    fast_handle=iMA(InpSymbol,InpTimeframe,InpFastEMA,0,MODE_EMA,PRICE_CLOSE);
    slow_handle=iMA(InpSymbol,InpTimeframe,InpSlowEMA,0,MODE_EMA,PRICE_CLOSE);
    atr_handle=iATR(InpSymbol,InpTimeframe,InpATRPeriod);
+   // Also request ADX for diagnostics when the filter is OFF, without making it mandatory.
+   adx_handle=iADX(InpSymbol,InpTimeframe,InpADXPeriod);
    if(fast_handle==INVALID_HANDLE || slow_handle==INVALID_HANDLE || atr_handle==INVALID_HANDLE)
    { Log(StringFormat("Indicator initialization failed: %d",GetLastError())); return INIT_FAILED; }
+   if(adx_handle==INVALID_HANDLE)
+   {
+      Log(StringFormat("ADX initialization failed: %d",GetLastError()));
+      if(InpUseADXFilter) return INIT_FAILED;
+   }
    if(!UpdateDailyState()) return INIT_FAILED;
    last_bar=iTime(InpSymbol,InpTimeframe,0); // No stale signal immediately after attachment.
-   Log("Initialized: demo/tester only, closed-bar signals, EURUSD H1.");
+   Log(StringFormat("Initialized v1.10: demo/tester only, EURUSD H1; ADX_filter=%s period=%d threshold=%.4f risk=%.4f%% signal_logging=%s",
+       InpUseADXFilter?"on":"off",InpADXPeriod,InpMinADX,InpRiskPercent,InpLogSignals?"on":"off"));
    return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
@@ -261,28 +381,56 @@ void OnDeinit(const int reason)
    if(fast_handle!=INVALID_HANDLE) IndicatorRelease(fast_handle);
    if(slow_handle!=INVALID_HANDLE) IndicatorRelease(slow_handle);
    if(atr_handle!=INVALID_HANDLE) IndicatorRelease(atr_handle);
+   if(adx_handle!=INVALID_HANDLE) IndicatorRelease(adx_handle);
    Log(StringFormat("Stopped; reason=%d",reason));
+}
+void LogDataWait(const datetime bar,const string reason)
+{
+   if(data_warning_bar==bar) return;
+   data_warning_bar=bar;
+   if(InpLogSignals) Log("Signal evaluation waiting for EMA data: bar="+TimeToString(bar,TIME_DATE|TIME_MINUTES)+" reason="+reason);
+}
+bool ReadClosedValue(const int handle,const int required,double &value)
+{
+   value=EMPTY_VALUE;
+   if(handle==INVALID_HANDLE || BarsCalculated(handle)<required) return false;
+   double buffer[1];
+   // Buffer 0 is the main ADX line for iADX and the ATR line for iATR.
+   if(CopyBuffer(handle,0,1,1,buffer)!=1 || !SFBValidIndicator(buffer[0])) return false;
+   value=buffer[0];
+   return true;
 }
 void OnTick()
 {
    if(!SafeAccount() || !UpdateDailyState()) return;
-   if(daily_locked) { if(InpCloseOnDailyLimit) CloseOwnPositions(); return; }
+   if(daily_locked && InpCloseOnDailyLimit) CloseOwnPositions();
+   // Continue signal diagnostics during a lock. Enter() refuses all new entries.
    datetime bar=iTime(InpSymbol,InpTimeframe,0);
    if(bar<=0 || bar==last_bar) return;
-   int required=MathMax(InpSlowEMA,InpATRPeriod)+3;
-   if(BarsCalculated(fast_handle)<required || BarsCalculated(slow_handle)<required
-      || BarsCalculated(atr_handle)<required) return;
-   double fast[2],slow[2],atr[1];
+   if(last_bar==0) { last_bar=bar; return; } // Initial history may not have been ready in OnInit.
+   int required=InpSlowEMA+3;
+   if(BarsCalculated(fast_handle)<required || BarsCalculated(slow_handle)<required)
+   { LogDataWait(bar,"EMA_warmup"); return; }
+   double fast[2],slow[2];
    // CopyBuffer writes oldest first: [0]=bar 2, [1]=bar 1. Never read bar 0.
-   if(CopyBuffer(fast_handle,0,1,2,fast)!=2 || CopyBuffer(slow_handle,0,1,2,slow)!=2
-      || CopyBuffer(atr_handle,0,1,1,atr)!=1) return;
+   if(CopyBuffer(fast_handle,0,1,2,fast)!=2 || CopyBuffer(slow_handle,0,1,2,slow)!=2)
+   { LogDataWait(bar,"EMA_CopyBuffer_failed"); return; }
    for(int i=0;i<2;i++)
-      if(!MathIsValidNumber(fast[i]) || !MathIsValidNumber(slow[i])
-         || fast[i]==EMPTY_VALUE || slow[i]==EMPTY_VALUE) return;
-   if(!MathIsValidNumber(atr[0]) || atr[0]<=0 || atr[0]==EMPTY_VALUE) return;
+      if(!SFBValidIndicator(fast[i]) || !SFBValidIndicator(slow[i]))
+      { LogDataWait(bar,"EMA_invalid_value"); return; }
    last_bar=bar; // One attempt per bar, including skipped/rejected orders.
-   if(fast[0]<=slow[0] && fast[1]>slow[1]) Enter(ORDER_TYPE_BUY,atr[0]);
-   else if(fast[0]>=slow[0] && fast[1]<slow[1]) Enter(ORDER_TYPE_SELL,atr[0]);
+   int direction=SFBCrossover(fast[0],slow[0],fast[1],slow[1]);
+   if(direction==0) return;
+   SignalContext signal={};
+   signal.bar=iTime(InpSymbol,InpTimeframe,1);
+   signal.direction=direction;
+   signal.fast_previous=fast[0];
+   signal.slow_previous=slow[0];
+   signal.fast_closed=fast[1];
+   signal.slow_closed=slow[1];
+   signal.atr_ready=ReadClosedValue(atr_handle,InpATRPeriod+3,signal.atr) && signal.atr>0;
+   signal.adx_ready=ReadClosedValue(adx_handle,2*InpADXPeriod+3,signal.adx) && signal.adx>=0 && signal.adx<=100;
+   Enter(signal);
 }
 void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &request,const MqlTradeResult &result)
 {
